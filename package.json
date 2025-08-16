@@ -1,14 +1,11 @@
 {
   "name": "solana-rug-tracker",
-  "version": "1.0.0",
-  "description": "Bot de suivi des rugpulls Solana",
+  "version": "1.1.0",
+  "type": "module",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
+  "scripts": { "start": "node index.js" },
   "dependencies": {
-    "@solana/web3.js": "^1.95.3",
-    "dotenv": "^16.4.5"
+    "@solana/web3.js": "1.95.0",
+    "dotenv": "16.4.5"
   }
 }
-
