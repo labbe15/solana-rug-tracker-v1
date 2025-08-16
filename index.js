@@ -17,21 +17,23 @@ const MIN_SPL_UNITS  = Number(process.env.MIN_SPL_UNITS || 1e6);
 const MAX_DEPTH      = Number(process.env.MAX_DEPTH || 6);
 const TOP_CHILDREN   = Number(process.env.TOP_CHILDREN || 3);
 
-const BACKFILL_ALL   = (process.env.BACKFILL_ALL ?? "true").toLowerCase() === "true";
-const BACKFILL_LIMIT = Number(process.env.BACKFILL_LIMIT || 0); // 0 = illimité
+// Backfill total (par graph), avec cap optionnel
+const BACKFILL_ALL     = (process.env.BACKFILL_ALL ?? "true").toLowerCase() === "true";
+const BACKFILL_LIMIT   = Number(process.env.BACKFILL_LIMIT || 0);   // 0 = illimité (signatures)
+const MAX_BACKFILL_ADDRS = Number(process.env.MAX_BACKFILL_ADDRS || 0); // 0 = illimité (adresses)
 
-// Throttle (réduire 429) — tu peux ajuster via Variables Railway
-const PAGE_SIZE     = Number(process.env.PAGE_SIZE     || 25);  // nb de signatures par page (getSignaturesForAddress)
+/** Throttle/Anti-429 */
+const PAGE_SIZE     = Number(process.env.PAGE_SIZE     || 25);
 const REQ_DELAY_MS  = Number(process.env.REQ_DELAY_MS  || 250); // pause entre pages
 const TX_DELAY_MS   = Number(process.env.TX_DELAY_MS   || 150); // pause entre tx
-const MAX_RETRIES   = Number(process.env.MAX_RETRIES   || 3);   // retries pour les appels critiques
-const RETRY_BASE_MS = Number(process.env.RETRY_BASE_MS || 500); // backoff initial
+const MAX_RETRIES   = Number(process.env.MAX_RETRIES   || 3);
+const RETRY_BASE_MS = Number(process.env.RETRY_BASE_MS || 500);
 
-// Liste d’adresses CEX à ignorer (si tu en as)
+/** CEX ignore list */
 const CEX = new Set((process.env.CEX_HOT_WALLETS || "")
   .split(",").map(s=>s.trim()).filter(Boolean));
 
-// Program IDs utiles
+/** Program IDs utiles */
 const TOKEN_PROGRAMS = new Set([
   "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", // SPL
   "TokenzQdBNbLqP5VEh9bSTBz2T9SxH3hszMpyyZHPv9"  // Token-2022
@@ -41,9 +43,12 @@ const TOKEN_PROGRAMS = new Set([
 const connFast = new Connection(RPC_HTTP, { commitment: "processed", wsEndpoint: RPC_WSS });
 const connConf = new Connection(RPC_HTTP, { commitment: "confirmed", wsEndpoint: RPC_WSS });
 
-const WATCH = new Map(); // addr -> { depth, subId }
-const DEPTH = new Map(); // addr -> depth (référence pendant backfill)
-const SEEN  = new Set(); // signatures déjà traitées
+const WATCH       = new Map();   // addr -> { depth, subId }
+const DEPTH       = new Map();   // addr -> depth minimal observé
+const SEEN        = new Set();   // signatures déjà traitées
+const ENQUEUED    = new Set();   // adresses en file d'attente de backfill
+const BACKFILLED  = new Set();   // adresses déjà backfillées
+let   IN_BACKFILL = true;        // tant que true, on ignore les logs live
 
 const isCEX = (a)=>CEX.has(a);
 const sleep = (ms)=>new Promise(r=>setTimeout(r, ms));
@@ -86,25 +91,28 @@ async function getParsedTx(signature) {
   );
 }
 
-/** ========= CŒUR ========= */
+/** ========= CORE ========= */
+function trackDepth(addr, depth){
+  if (!DEPTH.has(addr) || depth < DEPTH.get(addr)) DEPTH.set(addr, depth);
+}
+
 function addAddress(addr, depth=0, subscribeNow=true){
   if (!addr) return;
   if (depth > MAX_DEPTH) return;
+  trackDepth(addr, depth);
 
-  // garde la plus petite profondeur rencontrée pour cette adresse
-  if (!DEPTH.has(addr) || depth < DEPTH.get(addr)) DEPTH.set(addr, depth);
-
-  if (!subscribeNow) return; // pendant le backfill, on peut différer l'abonnement WS
+  if (!subscribeNow) return;        // pendant backfill, on diffère WS
 
   if (WATCH.has(addr)) return;
   let pk; try { pk = new PublicKey(addr); } catch { return; }
-  const subId = connFast.onLogs(pk, (lg) => onLogs(addr, DEPTH.get(addr) ?? depth, lg), "processed");
+  const subId = connFast.onLogs(pk, (lg)=>onLogs(addr, DEPTH.get(addr) ?? depth, lg), "processed");
   WATCH.set(addr, { depth, subId });
   info(`Subscribed: ${addr} (depth ${depth})`);
 }
 
 async function onLogs(addr, depth, lg){
   try {
+    if (IN_BACKFILL) return;        // on ignore le live tant que le backfill n'est pas fini
     const sig = lg?.signature;
     if (!sig || SEEN.has(sig)) return;
     await handleSignature(addr, depth, sig);
@@ -114,18 +122,17 @@ async function onLogs(addr, depth, lg){
 async function handleSignature(fromAddr, depth, signature){
   SEEN.add(signature);
 
-  // Récupération TX parsée (avec retry/backoff)
   const tx = await getParsedTx(signature);
   if (!tx?.transaction) return;
 
-  // Signal InitializeMint (nouveau token)
-  const logs = tx?.meta?.logMessages || [];
-  if (logs.some(l => l.includes("Instruction: InitializeMint"))) {
+  // Signal InitializeMint
+  const logsMsgs = tx?.meta?.logMessages || [];
+  if (logsMsgs.some(l => l.includes("Instruction: InitializeMint"))) {
     log(`🚨 InitializeMint | signer≈${fromAddr} | sig=${signature}`);
   }
 
-  // Extraire transferts sortants (SOL + SPL simple)
-  const dests = new Map(); // dest -> agg
+  // Extraire sorties
+  const dests = new Map();
   const instrs = tx.transaction.message.instructions || [];
 
   for (const ins of instrs) {
@@ -159,40 +166,49 @@ async function handleSignature(fromAddr, depth, signature){
 
   if (!dests.size) return;
 
-  // suivre top-N
   const top = [...dests.entries()].sort((a,b)=>b[1]-a[1]).slice(0, TOP_CHILDREN);
   for (const [to, amt] of top) {
     const nextDepth = depth + 1;
     if (nextDepth > MAX_DEPTH) { warn("Max depth:", to); continue; }
     log(`➡️  ${fromAddr} -> ${to} | amt≈${amt} | depth ${nextDepth} | sig=${signature}`);
-    // Pendant backfill on peut différer l'abonnement WS; on ajoute juste l'adresse et la profondeur.
+
+    // Pendant backfill: on alimente la queue (sans WS)
     addAddress(to, nextDepth, false);
+    if (IN_BACKFILL && (MAX_BACKFILL_ADDRS === 0 || (BACKFILLED.size + ENQUEUED.size) < MAX_BACKFILL_ADDRS)) {
+      if (!ENQUEUED.has(to) && !BACKFILLED.has(to)) {
+        ENQUEUED.add(to);
+        BACKFILL_QUEUE.push({ addr: to, depth: nextDepth });
+      }
+    }
   }
 }
 
-/** ========= BACKFILL ========= */
-async function backfillAllFrom(addr){
-  if (!BACKFILL_ALL) return;
+/** ========= BACKFILL EN LARGEUR (QUEUE) ========= */
+const BACKFILL_QUEUE = [];
+
+async function backfillOne(addr){
+  if (!BACKFILL_ALL) return 0;
+  if (BACKFILLED.has(addr)) return 0;
+
   const pk = new PublicKey(addr);
-  info(`Backfill total pour ${addr} ...${BACKFILL_LIMIT ? ` (limité à ${BACKFILL_LIMIT} signatures)` : ""}`);
-  let before = undefined;
-  let count  = 0;
+  BACKFILLED.add(addr);
+  let before = undefined, count = 0;
+
+  info(`Backfill ${addr} ...`);
 
   while (true) {
     const sigs = await getSigsPage(pk, before);
     if (!sigs.length) break;
 
-    // prépare page suivante
     before = sigs[sigs.length - 1].signature;
 
-    // traiter du plus vieux au plus récent (reverse)
+    // plus vieux → plus récent
     const batch = sigs.slice().reverse();
     for (const s of batch) {
-      if (BACKFILL_LIMIT && count >= BACKFILL_LIMIT) {
-        info(`Backfill interrompu (limite atteinte) pour ${addr} (${count} sigs).`);
-        return;
+      if (BACKFILL_LIMIT && SEEN.size >= BACKFILL_LIMIT) {
+        info(`Backfill interrompu (BACKFILL_LIMIT atteint)`);
+        return count;
       }
-
       if (!SEEN.has(s.signature)) {
         try {
           await handleSignature(addr, DEPTH.get(addr) ?? 0, s.signature);
@@ -207,36 +223,41 @@ async function backfillAllFrom(addr){
           }
         }
       }
-
-      // throttle entre transactions
       await sleep(TX_DELAY_MS);
     }
-
-    // throttle entre pages
     await sleep(REQ_DELAY_MS);
-
-    if (BACKFILL_LIMIT && count >= BACKFILL_LIMIT) break;
   }
 
-  info(`Backfill terminé pour ${addr} (${count} signatures traitées).`);
+  info(`Backfill terminé pour ${addr} (${count} signatures).`);
+  return count;
+}
+
+async function backfillBFS(){
+  // Seeds → dans la queue
+  for (const a of SEEDS) {
+    trackDepth(a, 0);
+    if (!ENQUEUED.has(a)) { ENQUEUED.add(a); BACKFILL_QUEUE.push({ addr: a, depth: 0 }); }
+  }
+
+  while (BACKFILL_QUEUE.length) {
+    const { addr } = BACKFILL_QUEUE.shift();
+    await backfillOne(addr);
+  }
 }
 
 /** ========= BOOT ========= */
-log("--- Rug Tracker (Backfill TOTAL → WebSocket) ---");
+log("--- Rug Tracker (Backfill total en largeur → WebSocket) ---");
 log("Seeds:", SEEDS.join(", "));
 log(`MIN_SOL=${MIN_SOL} | MIN_SPL_UNITS=${MIN_SPL_UNITS} | TOP_CHILDREN=${TOP_CHILDREN} | MAX_DEPTH=${MAX_DEPTH}`);
 log(`Throttle → PAGE_SIZE=${PAGE_SIZE} | REQ_DELAY_MS=${REQ_DELAY_MS} | TX_DELAY_MS=${TX_DELAY_MS} | RETRIES=${MAX_RETRIES}`);
 
 (async ()=>{
-  // 1) Préparer la profondeur et construire le graphe via backfill (sans WS)
-  for (const a of SEEDS) addAddress(a, 0, false);
-  for (const a of SEEDS) {
-    try { await backfillAllFrom(a); }
-    catch (e){ err("Backfill error", a, e?.message || e); }
-  }
+  // 1) Backfill en largeur de tout le graphe (pas de WS pendant cette phase)
+  await backfillBFS();
 
-  // 2) Brancher les WS sur toutes les adresses connues
+  // 2) Quand la queue est vide, on passe en temps réel : WS sur TOUTES les adresses connues
+  IN_BACKFILL = false;
   for (const [addr, depth] of DEPTH.entries()) addAddress(addr, depth, true);
 
-  log("✅ Backfill terminé → passage en temps réel.");
+  log("✅ Backfill COMPLET → passage en temps réel.");
 })();
