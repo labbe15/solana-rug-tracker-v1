@@ -172,16 +172,29 @@ async function handleSignature(fromAddr, depth, signature){
       }
     }
 
-    // SPL simple
+    // SPL (simple) + résolution ATA → OWNER
     const isSpl = (program === "spl-token") || TOKEN_PROGRAMS.has(programId);
     if (isSpl && parsed?.type && (parsed.type === "transfer" || parsed.type === "transferChecked")) {
       const inf = parsed.info || {};
       const owners = [inf.owner, inf.sourceOwner, inf.authority].filter(Boolean);
       if (owners.includes(fromAddr)) {
-        const toOwner = inf.destinationOwner || inf.destination || inf.account || null;
+        const rawTo = inf.destinationOwner || inf.destination || inf.account || null;
         const amt = Number(inf.amount || 0);
-        if (toOwner && amt >= MIN_SPL_UNITS && !CEX.has(toOwner))
-          dests.set(toOwner, (dests.get(toOwner)||0) + amt);
+        if (rawTo && amt >= MIN_SPL_UNITS) {
+          let follow = rawTo;
+          try {
+            // Si c'est une ATA SPL, remonter au owner du token account
+            const accInfo = await connConf.getParsedAccountInfo(new PublicKey(rawTo));
+            const parsedAcc = accInfo?.value?.data?.parsed;
+            if (parsedAcc?.type === "account" && parsedAcc?.info?.owner) {
+              follow = parsedAcc.info.owner;
+              console.log(`   [ATA→OWNER] ${rawTo} → ${follow}`);
+            }
+          } catch {/* silencieux */}
+          if (follow && !CEX.has(follow)) {
+            dests.set(follow, (dests.get(follow)||0) + amt);
+          }
+        }
       }
     }
   }
@@ -196,7 +209,7 @@ async function handleSignature(fromAddr, depth, signature){
 
     // Pendant backfill: on alimente la queue sans WS
     addAddress(to, nextDepth, false);
-    if (IN_BACKFILL && (MAX_BACKFILL_ADDRS === 0 || (ENQUEUED.size) < MAX_BACKFILL_ADDRS)) {
+    if (IN_BACKFILL && (MAX_BACKFILL_ADDRS === 0 || ENQUEUED.size < MAX_BACKFILL_ADDRS)) {
       if (!ENQUEUED.has(to)) {
         ENQUEUED.add(to);
         BACKFILL_QUEUE.push({ addr: to, depth: nextDepth });
@@ -268,7 +281,7 @@ async function backfillBFS(){
     if (BACKFILL_QUEUE.length === 0) {
       if (lastWasEmpty) break;      // deux fois de suite vide ⇒ terminé
       lastWasEmpty = true;
-      await sleep(2000);            // fenêtre pour capturer des adresses ajoutées "en retard"
+      await sleep(2000);            // fenêtre pour capter des adresses ajoutées "en retard"
     } else {
       lastWasEmpty = false;
     }
@@ -286,11 +299,8 @@ console.log(`Throttle → PAGE_SIZE=${PAGE_SIZE} | REQ_DELAY_MS=${REQ_DELAY_MS} 
 
 (async ()=>{
   // 1) Backfill complet (pas de WS pendant cette phase)
-  try {
-    await backfillBFS();
-  } catch (e) {
-    err("Backfill global error:", e?.message || e);
-  }
+  try { await backfillBFS(); }
+  catch (e) { err("Backfill global error:", e?.message || e); }
 
   // 2) Quand la queue est vraiment vide, on passe en temps réel : WS sur toutes les adresses connues
   IN_BACKFILL = false;
