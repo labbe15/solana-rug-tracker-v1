@@ -6,7 +6,7 @@ const RPC_HTTP = process.env.RPC_HTTP || "https://api.mainnet-beta.solana.com";
 const RPC_WSS  = process.env.RPC_WSS  || "wss://api.mainnet-beta.solana.com";
 const SEEDS = (process.env.WATCH_ADDRS || process.env.SEED_ADDR || "")
   .split(",").map(s=>s.trim()).filter(Boolean);
-if (!SEEDS.length) { console.error("❌ WATCH_ADDRS (ou SEED_ADDR) manquant."); process.exit(1); }
+if (!SEEDS.length) { console.error("8X7pr6Zk1hX3r4eZ4iGDaohF9ZNpS2tUn8LccG4fSheQ"); process.exit(1); }
 
 const LOOKBACK_MIN   = Number(process.env.LOOKBACK_MIN   || 60);   // rétro (minutes)
 const MIN_SOL        = Number(process.env.MIN_SOL        || 0.2);  // seuil transferts SOL
